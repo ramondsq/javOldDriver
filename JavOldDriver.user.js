@@ -2833,7 +2833,7 @@
                 },
                 javlibrary: {
                     type: 0,
-                    re: /.*\?v=jav.*/,
+                    re: /.*\?v=jav.*|.*\/jav[a-z0-9]+\.html/,
                     vid: () => {
                         let avid = $('#video_id')[0].getElementsByClassName('text')[0].getAttribute("avid");
                         return Common.getAvCode(avid);
