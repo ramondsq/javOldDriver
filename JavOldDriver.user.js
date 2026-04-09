@@ -426,6 +426,9 @@
          * @returns {Promise} 
          */
         static request(url, referrerStr, timeoutInt) {
+            if (Common.isSameOriginUrl(url)) {
+                return Common.requestByFetch(url, timeoutInt);
+            }
             return new Promise((resolve, reject) => {
                 console.log(`发起网址请求：${url}`);
                 GM_xmlhttpRequest({
@@ -460,6 +463,63 @@
                 });
             });
         }
+        /**
+         * 是否同源请求
+         * @param {string} url
+         * @returns {boolean}
+         */
+        static isSameOriginUrl(url) {
+            try {
+                return new URL(url, location.href).origin === location.origin;
+            } catch (e) {
+                return false;
+            }
+        }
+        /**
+         * 同源请求优先走页面上下文 fetch，复用 Cloudflare clearance cookie
+         * @param {string} url
+         * @param {number} timeoutInt
+         * @returns {Promise}
+         */
+        static requestByFetch(url, timeoutInt) {
+            return new Promise((resolve) => {
+                let controller = new AbortController();
+                let timeout = setTimeout(() => {
+                    controller.abort();
+                }, timeoutInt > 0 ? timeoutInt : 20000);
+                fetch(url, {
+                    method: 'GET',
+                    credentials: 'include',
+                    cache: 'no-store',
+                    signal: controller.signal
+                }).then(async (response) => {
+                    let responseText = await response.text();
+                    clearTimeout(timeout);
+                    resolve({
+                        status: response.status,
+                        responseText,
+                        response: responseText,
+                        finalUrl: response.url || url,
+                        loadstuts: response.ok
+                    });
+                }).catch((error) => {
+                    clearTimeout(timeout);
+                    if (error && error.name === "AbortError") {
+                        console.log(`${url} ${timeoutInt > 0 ? timeoutInt : 20000}ms timeout`);
+                    } else {
+                        console.log(`${url} error`);
+                        console.log(error);
+                    }
+                    resolve({
+                        status: 0,
+                        responseText: "",
+                        response: "",
+                        finalUrl: url,
+                        loadstuts: false
+                    });
+                });
+            });
+        }
 
         /**
          * 发起网络请求
@@ -468,7 +528,9 @@
          */
         static requestGM_XHR(details) {
             return new Promise((resolve, reject) => {
-                console.log(`发起网址请求：${details.url}`);
+                if (!Common.isSameOriginUrl(details.url)) {
+                    console.log(`发起网址请求：${details.url}`);
+                }
                 let req = GM_xmlhttpRequest({
                     method: details.method ? details.method : "GET",
                     url: details.url,
@@ -517,6 +579,42 @@
                 }
             }
             return letter.toString().replace(/,/g, "-") + "-" + num;
+        }
+        /**
+         * 从JavLibrary详情页链接中提取影片索引编码
+         * 兼容旧版 ?v=javxxxxx 和新版 /javxxxxx.html 两种形式
+         * @param {string} url
+         * @returns {string}
+         */
+        static extractJavLibMovieId(url) {
+            if (!url) return "";
+            let targetUrl = String(url).trim();
+            let match = targetUrl.match(/[?&]v=(jav[a-z0-9]+)/i);
+            if (match && match[1]) return match[1];
+            match = targetUrl.match(/\/(jav[a-z0-9]+)(?:\.html)?(?:[?#]|$)/i);
+            if (match && match[1]) return match[1];
+            match = targetUrl.match(/^(jav[a-z0-9]+)$/i);
+            return (match && match[1]) ? match[1] : "";
+        }
+        /**
+         * 获取JavLibrary详情页影片索引编码
+         * @param {jQuery} $doc
+         * @param {string} fallbackUrl
+         * @returns {string}
+         */
+        static getJavLibMovieIndex($doc, fallbackUrl) {
+            let href = $('#video_title a', $doc).attr('href');
+            return Common.extractJavLibMovieId(href)
+                || Common.extractJavLibMovieId(fallbackUrl)
+                || "";
+        }
+        /**
+         * 获取JavLibrary影片标题
+         * @param {jQuery} $doc
+         * @returns {string}
+         */
+        static getJavLibMovieTitle($doc) {
+            return $('#video_title h3', $doc).text().trim() || $('#video_title a', $doc).text().trim();
         }
         /**
          * 通过图片或视频url解析出DmmId
@@ -1043,7 +1141,8 @@
          * @returns {boolean}
          */
         static browseJavidHasCache(javId) {
-            return GM_getValue("myBrowseJavidArray", '[]').indexOf(javId) > 0 ? true : false;
+            let myBrowseJavidArray = JSON.parse(GM_getValue("myBrowseJavidArray", '[]'));
+            return myBrowseJavidArray.indexOf(javId) >= 0;
         }
         /**
          * 保存番号到GM缓存
@@ -1158,7 +1257,7 @@
                         let movie = $movList.get(i);
                         let $aEle = $($(movie).children("td.title").find("a").get(0));
                         // 索引编码
-                        let index_cd = $aEle.attr("href").split("=")[1];
+                        let index_cd = Common.extractJavLibMovieId($aEle.attr("href"));
                         // 番号
                         let code = $aEle.attr("title").match(/^[A-Za-z0-9-]+/g);
                         // 创建时间
@@ -1323,20 +1422,22 @@
             });
         }
 
-        static getMovie($doc) {
+        static getMovie($doc, pageUrl) {
+            let coverImgUrl = $('#video_jacket_img', $doc).attr("src") || "";
             return {
-                index_cd: $('#video_title a', $doc).attr('href').split("v=")[1],
-                code: $('.header', $doc)[0].nextElementSibling.textContent,
+                index_cd: Common.getJavLibMovieIndex($doc, pageUrl),
+                code: $('#video_id .text', $doc).attr("avid") || $('#video_id .text', $doc).text().trim()
+                    || $('.header', $doc)[0].nextElementSibling.textContent.replace(/\(←点击复制\)/g, "").trim(),
                 release_date: $('#video_date .text', $doc).text(),
-                duration: $('#video_length .text', $doc).text(),
+                duration: parseInt($('#video_length .text', $doc).text(), 10) || 0,
                 director: $('#video_director .text', $doc).text(),
                 maker: $('#video_maker .text', $doc).text(),
                 score: $('#video_review .text .score', $doc).text(),
                 actor: $('#video_cast .text', $doc).text(),
-                cover_img_url: $('#video_jacket_img', $doc).attr("src").replace("http://", "").replace("https://", ""),
-                thumbnail_url: $('#video_jacket_img', $doc).attr("src").replace("http://", "").replace("https://", "").replace("pl", "ps"),
+                cover_img_url: coverImgUrl.replace("http://", "").replace("https://", ""),
+                thumbnail_url: coverImgUrl.replace("http://", "").replace("https://", "").replace("pl", "ps"),
                 prev_img_url: "",
-                movie_name: $('#video_title a', $doc).text(),
+                movie_name: Common.getJavLibMovieTitle($doc),
                 publisher: $('#video_label .text a', $doc).text(),
                 add_time: (new Date()).Format("yyyy-MM-dd hh:mm:ss"),
                 pick_code: '',
@@ -1354,11 +1455,11 @@
         static syncMovie(result) {
             let commonClass = Common;// 无此步骤Common作用域失效,暂时未知原因
             let $doc = $(commonClass.parsetext(result.responseText));
-            let movie = Jav.getMovie($doc);
+            let movie = Jav.getMovie($doc, result.finalUrl);
             let myBrowseJsonArray = JSON.parse(GM_getValue("myBrowseAllData", "[]"));
             if (myBrowseJsonArray.length > 0) {
                 let jsonObj = myBrowseJsonArray.filter((p) => {
-                    return p.index_cd == result.finalUrl.split("v=")[1];
+                    return p.index_cd == Common.extractJavLibMovieId(result.finalUrl);
                 });
                 if (jsonObj.length > 0) movie.add_time = jsonObj[0].add_time;
             }
@@ -1371,7 +1472,7 @@
          */
         static javlibSaveData(AVID, pickcode, pm_mater) {
             //console.log($(document));
-            let movie = Jav.getMovie($(document));
+            let movie = Jav.getMovie($(document), location.href);
             movie.pick_code = pickcode;
             let newId = Common.getAvCode(AVID);
             Common.addBrowseJavidCache(AVID);
@@ -1451,14 +1552,6 @@
                         $(".left select").after("<a href='/cn/vl_bestrated.php?filterMyBrowse' class='hobby-a'>&nbsp;&nbsp;不看我阅览过(上个月)</a>");
                         $(".left select").after("<a href='/cn/vl_bestrated.php?filterMyBrowse&mode=2' class='hobby-a'>&nbsp;&nbsp;不看我阅览过(全部)</a>");
                         //todo
-                    } else if (document.URL.indexOf("vl_newrelease") > 0 || document.URL.indexOf("vl_update") > 0
-                        || document.URL.indexOf("vl_genre") > 0 || document.URL.indexOf("vl_mostwanted") > 0) {
-                        $(".displaymode .right").prepend("<a href='" + document.location.origin + document.location.pathname
-                            + "?delete9down" + document.location.search.replace('?', '&') + "' class='hobby-a'>只看9分以上&nbsp;&nbsp;</a>");
-                        $(".displaymode .right").prepend("<a href='" + document.location.origin + document.location.pathname
-                            + "?delete8down" + document.location.search.replace('?', '&') + "' class='hobby-a'>只看8分以上&nbsp;&nbsp;</a>");
-                        $(".displaymode .right").prepend("<a href='" + document.location.origin + document.location.pathname
-                            + "?delete7down" + document.location.search.replace('?', '&') + "' class='hobby-a'>只看7分以上&nbsp;&nbsp;</a>");
                     }
 
                     if ((/(bestrated|newrelease|newentries|vl_update|mostwanted|vl_star)/g).test(document.URL) ||
@@ -1470,66 +1563,6 @@
 
                         // 瀑布流脚本
                         thirdparty.waterfallScrollInit();
-
-                        let a1 = document.createElement('a');
-
-                        $(a1).append('按【VR】+评分排序&nbsp;&nbsp;');
-                        $(a1).css({
-                            "color": "blue",
-                            "font": "bold 12px monospace"
-                        });
-                        $(a1).attr("href", "#");
-                        $(a1).click(() => {
-                            let div_array = $("div.videos div.video");
-                            div_array.sort((a, b) => {
-                                let a_score = parseFloat($(a).children("a").attr("score"));
-                                let b_score = parseFloat($(b).children("a").attr("score"));
-                                if (a_score > b_score) {
-                                    return -1;
-                                } else if (a_score === b_score) {
-                                    return 0;
-                                } else {
-                                    return 1;
-                                }
-                            });
-                            div_array.sort((a, b) => {
-                                let a_val = $(a).children("a").attr("title").indexOf("【VR】") >= 0 ? 1 : 0;
-                                let b_val = $(b).children("a").attr("title").indexOf("【VR】") >= 0 ? 1 : 0;
-                                if (a_val > b_val) {
-                                    return -1;
-                                } else if (a_val === b_val) {
-                                    return 0;
-                                } else {
-                                    return 1;
-                                }
-                            });
-                            // 删除Dom列表数据关系，重新添加排序数据
-                            div_array.detach().appendTo("#waterfall");
-                        });
-
-                        let a2 = $(a1).clone();
-                        $(a2).html('按时间排序&nbsp;&nbsp;');
-                        $(a2).click(() => {
-                            let div_array = $("div.videos div.video");
-                            div_array.sort((a, b) => {
-                                let a_time = new Date($(a).children("a").attr("release_date").replace(/-/g, "\/")).getTime();
-                                let b_time = new Date($(b).children("a").attr("release_date").replace(/-/g, "\/")).getTime();
-                                let a_score = parseFloat($(a).children("a").attr("score"));
-                                let b_score = parseFloat($(b).children("a").attr("score"));
-                                if (a_time > b_time) {
-                                    return -1;
-                                } else if (a_time === b_time) {
-                                    return (a_score > b_score) ? -1 : 1;
-                                } else {
-                                    return 1;
-                                }
-                            });
-
-                            // 删除Dom列表数据关系，重新添加排序数据
-                            div_array.detach().appendTo("#waterfall");
-                        });
-                        $(".displaymode .right").prepend($(a2));
-                        $(".displaymode .right").prepend($(a1));
                     }
                 });
                 //JavWebSql.DBinit();
@@ -2405,6 +2438,12 @@
                         $("a", $("#vid_" + _vid)).first().mousedown((event) => {
                             // 判断鼠标左键或中间才执行
                             if (event.button < 2) {
+                                let clickedCode = $(elems[i]).find('.id').text().trim();
+                                if (clickedCode) {
+                                    Common.addBrowseJavidCache(clickedCode);
+                                    let avCode = Common.getAvCode(clickedCode);
+                                    if (avCode && avCode !== clickedCode) Common.addBrowseJavidCache(avCode);
+                                }
                                 // 设置点击后填充新的背景色peachpuff
                                 $("#vid_" + _vid).css("background-color", "#ffe7d3");
                             }
@@ -2425,51 +2464,12 @@
                                     $(indexCd_id).css("background-color", "#ffe7d3"); //hotpink,khaki,indianred,peachpuff
                                     if (results.length != 0 && results[0].is_sync) { //已经同步过
                                         extCode(indexCd_id, results[0].actor, results[0].release_date, results[0].score);
-                                    } else { //未同步过
-                                        getMovieInfo(true);
                                     }
                                     Common.addBrowseJavidCache(code);
                                 }
                             }
                             else if (Common.browseJavidHasCache(code)) {    //存在GM缓存中
-                                getMovieInfo(true);
-                            }
-                            else { //都不存在
-                                getMovieInfo(false);
-                            }
-
-                            function getMovieInfo(isSave) {
-                                //console.log(`push:${_vid}`);
-                                //console.log(w.queue);
-                                w.queue.push(() => {
-                                    let defer = $.Deferred();
-                                    let promise1 = Common.request(`https://${JAVLIB_DOMAIN}/ja/?v=${_vid}`);
-                                    promise1.then((result) => {
-                                        if(result.loadstuts && result.status < 300){
-                                            indexCd_id = "#vid_" + result.finalUrl.split("=")[1]; //例如：http://www.j12lib.com/cn/?v=javlikd42a
-                                            let doc = result.responseText;
-                                            let movie_info = doc.substring(doc.search(/<table id="video_jacket_info">/),
-                                                doc.search(/<div id="video_favorite_edit" class="">/));
-                                            // 阻止构造Document对象时加载src内容
-                                            movie_info = movie_info.replace("src", "hobbysrc");
-                                            let $doc = $(Common.parsetext(movie_info));
-                                            actor = $('#video_cast .text .star a', $doc).text();
-                                            dateString = $('#video_date .text', $doc).text();
-                                            pingfengString = $('#video_review .text .score', $doc).text();
-                                            extCode(indexCd_id, actor, dateString, pingfengString);
-                                            // todo 1118
-                                            if (isSave) Jav.syncMovie(result);
-                                        } else {
-                                            if(result.status > 300) console.log(`${result.finalUrl} 加载出错：${result.responseXML.title}`);
-                                        }
-                                        return Promise.resolve();
-                                    }).then(() => { // 等待0.8秒执行下一个任务，受Cloudflare限制访问
-                                        setTimeout(() => {
-                                            defer.resolve();
-                                        },800);
-                                    });
-                                    return defer.promise();
-                                });
+                                $("#vid_" + _vid).css("background-color", "#ffe7d3");
                             }
                         });
                     }
@@ -2832,9 +2832,9 @@
                 },
                 javlibrary: {
                     type: 0,
-                    re: /.*\?v=jav.*/,
+                    re: /(\/jav[a-z0-9]+\.html|[?&]v=jav[a-z0-9]+)/i,
                     vid: () => {
-                        let avid = $('#video_id')[0].getElementsByClassName('text')[0].getAttribute("avid");
+                        let avid = $('#video_id .text').attr("avid") || $('#video_id .text').text().trim();
                         return Common.getAvCode(avid);
                     },
                     proc: (main) => {
@@ -2852,13 +2852,18 @@
                             #video_info table {margin-top: 6px;border-bottom: 1px solid #ffffff;}
                         `);
 
-                        var tdE = $("td[style='vertical-align: top;']")[0];
+                        let $infoCells = $('#video_jacket_info td[style*="vertical-align: top"]');
+                        var tdE = $infoCells.get(0);
+                        if (!tdE) return;
                         tdE.id = "coverimg";
-                        $("td[style='vertical-align: top;']")[1].id = 'javtext';
+                        let textTd = $infoCells.get(1);
+                        if (textTd) textTd.id = 'javtext';
                         $('#leftmenu').remove();
                         $('#rightcolumn').attr("style", "margin: 0px 0px 0px 0px;width: 100%;padding: initial;");
-                        $(tdE.parentElement).append('<td id="hobby" style="vertical-align: top;"></td>');
-                        $('#hobby').append(main.cur_tab);
+                        if (!$('#hobby').length) {
+                            $(tdE.parentElement).append('<td id="hobby" style="vertical-align: top;"></td>');
+                        }
+                        $('#hobby').empty().append(main.cur_tab);
                     }
                 },
                 javstore: {
